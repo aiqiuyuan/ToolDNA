@@ -31,7 +31,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    data_source = "/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/data/0515/data_naive_description"
+    data_source = " "
 
     ds = datasets.load_dataset("json", data_files={
         "train":os.path.join(data_source, "train.jsonl"),
