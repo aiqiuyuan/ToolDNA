@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--hdfs_dir", default=None, 
                       help="HDFS directory to copy parquet files (optional)")
     parser.add_argument("--data_source", 
-                      default="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/data/0515/data_human_baseline",
+                      default="",
                       help="Path to source jsonl files")
     
     args = parser.parse_args()
