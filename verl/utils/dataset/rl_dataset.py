@@ -82,7 +82,7 @@ class RLHFDataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
-        self.return_full_prompt = config.get("return_full_prompt", False)
+        self.return_full_prompt = True
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
 

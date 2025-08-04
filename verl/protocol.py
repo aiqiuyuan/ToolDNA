@@ -309,8 +309,8 @@ class DataProto:
         """Check the consistency of the DataProto. Mainly for batch and non_tensor_batch
         We expose this function as a public one so that user can call themselves directly
         """
-        if self.batch is not None:
-            assert len(self.batch.batch_size) == 1, "only support num_batch_dims=1"
+        if isinstance(self.batch, dict) and 'batch_size' in self.batch:
+            assert len(self.batch['batch_size']) == 1, "only support num_batch_dims=1"
 
         if self.non_tensor_batch is not None:
             for key, val in self.non_tensor_batch.items():

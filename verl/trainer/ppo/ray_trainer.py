@@ -17,7 +17,15 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-
+import logging
+import copy
+from tensordict import TensorDict
+from transformers import PreTrainedTokenizer
+from typing import List, Dict, Any
+import verl.utils.torch_functional as verl_F
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.reward_score.tool_memory import ToolMemory
+from verl.utils.reward_score import tool_update_by_llm
 import json
 import os
 import uuid
@@ -28,6 +36,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Dict, Optional, Type
+from datetime import datetime
 
 import numpy as np
 import ray
@@ -62,6 +71,39 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 
 WorkerType = Type[Worker]
+
+
+
+def convert_to_ndarray(data: Any, expected_batch_size: int) -> np.ndarray:
+    """
+    转换数据为np.ndarray，并强制检查shape[0]是否等于expected_batch_size
+    """
+    if isinstance(data, np.ndarray):
+        if data.shape[0] != expected_batch_size:
+            raise ValueError(
+                f"数组 {data} 的shape[0] 应为 {expected_batch_size}，实际 {data.shape[0]}"
+            )
+        return data
+    elif isinstance(data, list):
+        # 列表长度必须等于批次大小（不足则填充，过长则截断）
+        if len(data) < expected_batch_size:
+            data += [data[-1]] * (expected_batch_size - len(data))  # 用最后一个元素填充
+        elif len(data) > expected_batch_size:
+            data = data[:expected_batch_size]  # 截断
+        # 处理字符串列表（保留原始类型）
+        if all(isinstance(item, str) for item in data):
+            return np.array(data, dtype=object)
+        else:
+            return np.array(data)
+    elif isinstance(data, str):
+        # 单个字符串扩展为长度batch_size的数组（dtype=object）
+        return np.array([data] * expected_batch_size, dtype=object)
+    elif isinstance(data, (int, float)):
+        # 标量扩展为长度batch_size的数组
+        return np.array([data] * expected_batch_size)
+    else:
+        # 其他类型转字符串（根据实际需求调整）
+        return np.array([str(data)] * expected_batch_size, dtype=object)
 
 
 class Role(Enum):
@@ -292,6 +334,7 @@ class RayPPOTrainer:
         val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
+        test_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name="cuda",
@@ -336,7 +379,7 @@ class RayPPOTrainer:
             raise NotImplementedError
 
         self._validate_config()
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, test_dataset, collate_fn, train_sampler)
 
     def _validate_config(self):
         config = self.config
@@ -451,7 +494,7 @@ class RayPPOTrainer:
 
         print("[validate_config] All configuration checks passed successfully!")
 
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
+    def _create_dataloader(self, train_dataset, val_dataset, test_dataset, collate_fn, train_sampler):
         """
         Creates the train and validation dataloaders.
         """
@@ -462,7 +505,10 @@ class RayPPOTrainer:
             train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
         if val_dataset is None:
             val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        if test_dataset is None:
+            test_dataset = create_rl_dataset(self.config.data.test_files, self.config.data, self.tokenizer, self.processor)
+        
+        self.train_dataset, self.val_dataset, self.test_dataset = train_dataset, val_dataset, test_dataset
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -493,10 +539,21 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
+        #这里添加一个test_dataloader
+        self.test_dataloader = StatefulDataLoader(
+            dataset=self.test_dataset,
+            batch_size=val_batch_size,
+            num_workers=self.config.data.get("dataloader_num_workers", 8),
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        assert len(self.test_dataloader) >= 1, "Test dataloader is empty!"
 
-        print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {len(self.val_dataloader)}")
+        print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {len(self.val_dataloader)}, Size of test dataloader: {len(self.test_dataloader)}")
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
@@ -574,6 +631,120 @@ class RayPPOTrainer:
         sample_scores = []
 
         for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            # repeat test batch
+            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+
+            # we only do validation on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                return {}
+
+            # Store original inputs
+            input_ids = test_batch.batch["input_ids"]
+            # TODO: Can we keep special tokens except for padding tokens?
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            if "multi_modal_inputs" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+            if "raw_prompt" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            if "tools_kwargs" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            test_gen_batch = test_batch.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+            )
+
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+            }
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            # pad to be divisible by dp_size
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            if not self.async_rollout_mode:
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            else:
+                self.async_rollout_manager.wake_up()
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                self.async_rollout_manager.sleep()
+
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            print("validation generation end")
+
+            # Store generated outputs
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+
+            # evaluate using reward_function
+            result = self.val_reward_fn(test_batch, return_dict=True)
+            reward_tensor = result["reward_tensor"]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            reward_extra_infos_dict["reward"].extend(scores)
+            if "reward_extra_info" in result:
+                for key, lst in result["reward_extra_info"].items():
+                    reward_extra_infos_dict[key].extend(lst)
+
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (var_name == core_var) and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}" in metric_name):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        return metric_dict
+
+    def _test(self):
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_scores = []
+
+        for test_data in self.test_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
@@ -852,6 +1023,85 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _log_batch_state(self, batch, step_name, debug_path, max_samples=2):
+        """动态记录batch的所有张量字段内容到日志文件，区分token字段和非token字段"""
+        with open(debug_path, "a", encoding="utf-8") as f:
+            f.write(f"\n===== [BATCH_STATE: {step_name}] =====\n")
+
+            # 记录batch.batch（张量数据）的结构和全部内容
+            f.write("--- batch.batch 结构 ---\n")
+            tensor_keys = list(batch.batch.keys())
+            f.write(f"包含的张量字段: {tensor_keys}\n")
+            
+            # 定义可解码的token字段白名单（仅这些字段尝试解码）
+            decode_whitelist = {"input_ids", "responses", "raw_prompt_ids"}
+            
+            for key in tensor_keys:  # 遍历当前batch的所有张量字段
+                value = batch.batch[key]
+                f.write(f"\n字段 [{key}] 信息:\n")
+                f.write(f"  形状: {value.shape if hasattr(value, 'shape') else '非张量'}\n")
+                f.write(f"  数据类型: {value.dtype if hasattr(value, 'dtype') else '非张量'}\n")
+                
+                if key in decode_whitelist:
+                    # 对token字段尝试解码（如input_ids, responses）
+                    f.write(f"  [解码尝试] 开始尝试解码字段 [{key}]...\n")
+                    try:
+                        sample_ids = value[:max_samples].cpu().numpy()
+                        f.write(f"  [解码调试] 提取样本形状: {sample_ids.shape}\n")
+                        
+                        valid_samples = []
+                        for i, ids in enumerate(sample_ids):
+                            # 跳过全为填充值的样本（假设0是填充值，可根据实际修改）
+                            if len(ids[ids != 0]) == 0:
+                                f.write(f"  [解码跳过] 样本{i}全为填充值，跳过解码\n")
+                                continue
+                            decoded = self.tokenizer.decode(ids, skip_special_tokens=True)
+                            valid_samples.append(f"样本{i}: {decoded[-1000:]}...")  # 截断长文本
+                        
+                        if valid_samples:
+                            f.write(f"  前{len(valid_samples)}条有效解码文本: {valid_samples}\n")
+                        else:
+                            f.write("  [解码结果] 无有效样本，跳过解码\n")
+                    except Exception as e:
+                        f.write(f"  [解码错误] 解码失败，原因: {str(e)}\n")
+                else:
+                    # 对非token字段（如position_ids, attention_mask）记录数值
+                    f.write(f"  [数值记录] 字段为非token类型，直接记录数值...\n")
+                    try:
+                        sample_values = value[:max_samples].cpu().numpy()
+                        f.write(f"  [数值调试] 提取样本形状: {sample_values.shape}\n")
+                        
+                        numeric_samples = []
+                        for i, vals in enumerate(sample_values):
+                            # 仅记录前20个数值（避免长序列刷屏）
+                            numeric_samples.append(f"样本{i}: {vals[:20].tolist()}...")
+                        
+                        f.write(f"  前{len(numeric_samples)}条数值样本: {numeric_samples}\n")
+                    except Exception as e:
+                        f.write(f"  [数值错误] 记录失败，原因: {str(e)}\n")
+
+                # 记录非张量字段（保持原逻辑）
+            f.write("\n\n--- batch.non_tensor_batch 结构 ---\n")
+            non_tensor_keys = list(batch.non_tensor_batch.keys())
+            f.write(f"包含的非张量字段: {non_tensor_keys}\n")
+            
+            for key in non_tensor_keys:
+                value = batch.non_tensor_batch[key]
+                f.write(f"\n字段 [{key}] 信息:\n")
+                f.write(f"  类型: {type(value)}\n")
+                if isinstance(value, (list, np.ndarray)):
+                    samples = value[:max_samples] if len(value) > max_samples else value
+                    f.write(f"  前{max_samples}条样本: {samples}\n")
+                else:
+                    f.write(f"  样本内容: {value}\n")
+
+            # 记录元信息（保持原逻辑）
+            f.write("\n\n--- 元信息 ---\n")
+            batch_size = len(batch.batch.get("input_ids", []))  # 用input_ids推断batch_size
+            f.write(f"batch_size: {batch_size}\n")
+            f.write(f"meta_info: {batch.meta_info}\n")
+            f.write(f"===== [BATCH_STATE: {step_name}] 结束 =====\n\n")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -872,18 +1122,62 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
+        str1 = """\n\n# 工具信息\n## 查询二手车库存\n工具名称：search_used_cars\n工具描述：可以通过查询内容和筛选条件对于库存内的车辆进行筛选，并展示数条搜索结果\n需要填入：\nquery (str)：查询的内容，可以类似“奔驰”，“x3”，“增程式”这类\nfilters (dict)：筛选项，具体可选的筛选项为：\n    price_range (List[int])：价格区间（单位是万元），用[15, 21]表示需要筛选15万到21万的车辆\n    mileage (List[int])：里程区间（单位是万公里），用[1, 6]表示需要筛选1万公里到6万公里里程的车辆\n    car_age (List[int])：车龄（单位是年），用[2, 4]表示需要筛选车龄为两年以上四年以下的车辆\n    energy_type (str)：能源类型，必须是[\"新能源\", \"非新能源\"]之一，纯电/插混/增程均属于\"新能源\"\n    category (List[str])：车辆级别，必须是[\"轿车\", \"SUV\", \"MPV\", \"跑车\"]中的一个或多个\n    emission_standard (List[str])：排放标准，必须是[\"国四\", \"国五\", \"国六\", \"国六b\"]中的一个或多个\npage (int)：当前页码，默认值为1\npage_size (int)：每页检索条数，默认值为5，最大值为30\n使用示例：\n    search_used_cars({\"query\": \"mini\", \"filters\": {\"car_age\": [1, 4]}})\n    search_used_cars({\"query\": \"宝马三系\", \"page_size\": 20})\n    search_used_cars({\"filters\": {\"energy_type\": \"新能源\", \"category\": [\"轿车\", \"跑车\"]}, \"page_size\": 30})\n\n## 查看二手车详情\n工具名称：view_details\n工具描述：查看二手车的某些方面的具体细节情况\n需要填入：\n    sku_ids (List[str])：车辆id的列表，可以从上下文或`search_used_cars`工具的结果中获取，禁止凭空捏造\n    aspects (List[str])：方面的列表，必须是[\"基础信息\",\"优势分析\",\"车况检测\",\"电池信息\",\"易损件\",\"整备清单\",\"参保期限\",\"保险理赔\",\"优惠活动\",\"选配清单\"]中的一个或多个，建议一次性查询多个方面的信息（\"基础信息\"包括钥匙数量等信息）\n使用示例：view_details({\"sku_ids\": [\"10086\"], \"aspects\": [\"车况检测\", \"参保期限\", \"保险理赔\"]})\n\n## 查看二手车辆参配\n工具名称：check_configs\n工具描述：查看二手车的某些方面的官方参数配置\n需要填入：\n    sku_ids (List[str])：车辆id的列表，可以从上下文或`search_used_cars`工具的结果中获取，禁止凭空捏造\n    aspects (List[str])：方面的列表，必须是[\"基本信息\",\"车身\",\"发动机\",\"电动机\",\"电池/充电\",\"变速箱\",\"底盘转向\",\"车轮制动\",\"主动安全\",\"被动安全\",\"辅助操控配置\",\"外部配置\",\"内部配置\",\"舒适/防盗配置\",\"座椅配置\",\"智能互联\",\"影音娱乐\",\"灯光配置\",\"玻璃后视镜\",\"空调冰箱\",\"智能化配置\"]中的一个或多个，建议一次性查询多个方面的信息\n使用示例：check_configs({\"sku_ids\": [\"10086\"], \"aspects\": [\"基本信息\", \"电动机\", \"电池/充电\"]})\n\n## 查询板车托运费\n工具名称：check_delivery_fee\n工具描述：查看从车辆所在城市使用板车托运至上牌城市的费用\n需要填入：\n    source_city (str)：车辆所在门店的所在城市，标准化的城市名，例如\"北京\"、\"上海\"、\"杭州\"等，而不是\"浙江杭州\"、\"上海市\"等\n    registration_city (str)：客户期望的上牌城市，标准化的城市名\n使用示例：check_delivery_fee({\"source_city\": \"武汉\", \"registration_city\": \"北京\"})\n\n## 查询在某城市上牌的迁入政策（限迁）\n工具名称：check_policy\n工具描述：查看需要将车辆在某城市上牌的迁入政策\n需要填入：\n    registration_city (str)：上牌城市，标准化的城市名\n使用示例：check_policy({\"registration_city\": \"海口\"})\n\n## 贷款计算\n工具名称：calculate_loan\n工具描述：计算贷款\n需要填入：\n    total_price (float)：二手车总价（单位万元），特指二手车价格，而不是贷款金额\n    down_payment_ratio (float)：首付比例，必须是[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]中的一个，假如客户要求比例是0.25，则四舍五入为0.3，假如客户要求比例是0.08，则四舍五入为0.1\n    periods (int)：贷款月限（36/48/60）\n使用示例：calculate_loan({\"total_price\": 19.88, \"down_payment_ratio\": 0.3, \"periods\": 36})\n\n## 计算器\n工具名称：calculator\n工具描述：计算器，用于做一些基础的加减乘除多步运算（当前场景下常见的是计算首期应付费用，首期应付费用=首付比例*当前车款价+上牌费+物流费）\n需要填入：\n    expression (str)：基本运算的表达式，例如\"45000+1000+2500\"、\"88000*0.2+1000+1050\"\n使用示例：calculator({\"expression\": \"68000*0.3+1000+2500\"})\n\n## 转人工\n工具名称：call_human\n工具描述：将对话交由人工客服处理\n需要填入：\n    reason (str)：转人工的原因，必须是[\"用户要求\",\"车辆选配\",\"视频看车\",\"征信审核\",\"其他原因\"]中的一个，当用户有上述意图时请及时使用此工具\n使用示例：call_human({\"reason\": \"视频看车\"})\n\n## 生成二手车链接（含下订入口）\n工具名称：create_car_urls\n工具描述：对具体的n辆二手车库存车辆生成相关页面链接，车源详情页链接内包含车辆详情、图片等，用户可自行浏览，下订页面可以直接自助下订，检测报告页面内有详细检测内容和细节图片\n需要填入：\n    sku_ids (List[str])：车辆id的列表，可以从上下文或`search_used_cars`工具的结果中获取，禁止凭空捏造\n    aspects (List[str])：方面的列表，必须是[\"车源详情页\",\"下订页面\",\"检测报告页面\"]中的一个或多个，如果需要则一次性生成多个方面的链接\n使用示例：create_car_urls({\"sku_ids\": [\"10086\"], \"aspects\": [\"车源详情页\", \"检测报告页面\"]})\n\n## 懂咔咔搜索\n工具名称：dcar_search\n工具描述：当有汽车相关知识需要联网搜索相关资料才能回答时，请使用懂咔咔搜索来获取实时知识\n需要填入：\n    query (str)：完整的检索词\n使用示例：\n    dcar_search({\"query\": \"17款的途观有手机app吗\"})\n    dcar_search({\"query\": \"19款理想L9 max和最新款有什么区别\"})\n    dcar_search({\"query\": \"su7 max型号是顶配版本吗\"})\n\n"""
+        memory = ToolMemory(str1)
+        
         # load checkpoint before doing anything
         self._load_checkpoint()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
+        SCORE_LOG_PATH = self.config.data.score_log_path
+        DEBUG_LOG_PATH = self.config.data.debug_log_path
+        try:
+            # 构造日志条目
+            step_entry = { 
+                "val_global_steps": self.global_steps
+                }
+
+            # 写入JSON Lines文件（每行一个独立JSON对象）
+            with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                json.dump(step_entry, f, ensure_ascii=False)
+                f.write("\n")  # 换行分隔不同条目
+            print(f"[DEBUG LOG] 已记录调试数据到 {SCORE_LOG_PATH}")
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                json.dump(step_entry, f, ensure_ascii=False)
+                f.write("\n")  # 换行分隔不同条目
+            print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+        except Exception as e:
+            print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
+            print(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+            
+        SCORE_LOG_PATH = self.config.data.score_log_path
+        DEBUG_LOG_PATH = self.config.data.debug_log_path
+        try:
+            # 构造日志条目
+            step_entry = { 
+                "test_global_steps": self.global_steps
+                }
+
+            # 写入JSON Lines文件（每行一个独立JSON对象）
+            with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                json.dump(step_entry, f, ensure_ascii=False)
+                f.write("\n")  # 换行分隔不同条目
+            print(f"[DEBUG LOG] 已记录调试数据到 {SCORE_LOG_PATH}")
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                json.dump(step_entry, f, ensure_ascii=False)
+                f.write("\n")  # 换行分隔不同条目
+            print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+        except Exception as e:
+            print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+        test_metrics = self._test()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -892,11 +1186,85 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
 
+        
+
         for epoch in range(self.config.trainer.total_epochs):
+            
+            
+
             for batch_dict in self.train_dataloader:
+                SCORE_LOG_PATH = self.config.data.score_log_path
+                DEBUG_LOG_PATH = self.config.data.debug_log_path
+                try:
+                    # 构造日志条目
+                    step_entry = { 
+                        "train_global_steps": self.global_steps
+                        }
+
+                    # 写入JSON Lines文件（每行一个独立JSON对象）
+                    with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                        json.dump(step_entry, f, ensure_ascii=False)
+                        f.write("\n")  # 换行分隔不同条目
+                    print(f"[DEBUG LOG] 已记录调试数据到 {SCORE_LOG_PATH}")
+                    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                        json.dump(step_entry, f, ensure_ascii=False)
+                        f.write("\n")  # 换行分隔不同条目
+                    print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+                except Exception as e:
+                    print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+
+                # #下面的部分是步间更新####
+                # print("\n====正在使用大模型更新工具描述====")
+                # try:
+                #     # 调用工具更新函数（传入文件路径和模型路径）
+                #     tool_update_by_llm.process_data(
+                #         file_path="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/debug_records_0629_dynamic_2_16.jsonl",
+                #         model_path="/mnt/bn/motor-nlp-team/models/LLM/base_models/DeepSeek-R1-Distill-Qwen-32B"
+                #     )
+                #     file_path="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/debug_records_0629_dynamic_2_16.jsonl"
+                #     print("\n====完成步间更新，正在清空实时数据文件====")
+                #     # 工具更新完成后，清空实时数据文件
+                #     if os.path.exists(file_path):
+                #         with open(file_path, "w") as f:
+                #             f.truncate(0)  # 清空文件内容
+                #         print(f"已清空实时数据文件: {file_path}")
+                #     else:
+                #         print(f"数据文件不存在（{file_path}），无需清空")
+                #     print("\n====已清空实时数据文件====")
+
+                # except Exception as e:
+                #     print(f"警告：工具更新或文件清空失败，原因: {str(e)}，主流程继续...")
+
+
                 metrics = {}
                 timing_raw = {}
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                ##这个位置是看要不要生成描述的
+                #batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch_original: DataProto = DataProto.from_single_dict(batch_dict)
+                batch = self._re_tokenize_with_dynamic_prompts(batch_original)
+                #self._log_batch_state(batch_original, "INITIAL_BATCH", DEBUG_PATH)  # 新增
+
+                # self._save_data_proto_prompts(
+                #     data_proto=batch_original,
+                #     prefix="original_prompt",
+                #     save_dir="prompt_validation"
+                # )
+                # === 动态Prompt处理 ===
+                # 1. 重新分词生成动态Prompt的input_ids（内部已调用_generate_dynamic_prompts）
+
+                
+                #self._log_batch_state(batch, "DYNAMIC_BATCH", DEBUG_PATH)  # 新增
+
+                # self._save_data_proto_prompts(
+                #     data_proto=batch,
+                #     prefix="processed_prompt",
+                #     save_dir="prompt_validation"
+                # )
+            
+               
+                # # 数据重复操作（此时dynamic_prompt长度应与batch一致）
+                # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -911,6 +1279,17 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                #self._log_batch_state(batch, "AFTER_POP_GEN_BATCH", DEBUG_PATH)  # 新增
+
+                # # 打印gen_batch中的input_ids解码结果（必须为"123"）
+                # if "input_ids" in gen_batch.batch:
+                #     decoded = [
+                #         self.tokenizer.decode(ids, skip_special_tokens=True)
+                #         for ids in gen_batch.batch["input_ids"][:3].cpu().numpy()
+                #     ]
+                #     print(f"[GEN_BATCH_DEBUG] gen_batch.input_ids解码: {decoded}")
+                # else:
+                #     print("[GEN_BATCH_DEBUG] gen_batch中无input_ids，模型将使用默认输入！")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -919,6 +1298,12 @@ class RayPPOTrainer:
                     with _timer("gen", timing_raw):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            #self._log_batch_state(batch=gen_batch, step_name="GENERATION_INPUT", debug_path=DEBUG_PATH)
+                            #self._log_batch_state(batch=gen_batch_output, step_name="GENERATION_OUTPUT", debug_path=DEBUG_PATH)
+
+                            
+                            
+                            
                         else:
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
@@ -942,10 +1327,18 @@ class RayPPOTrainer:
 
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
+                    #self._log_batch_state(batch, "AFTER_ADD_UID", DEBUG_PATH)  # 新增
+                    
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    #self._log_batch_state(batch, "AFTER_REPEAT", DEBUG_PATH)  # 新增
+                    
                     batch = batch.union(gen_batch_output)
+                    #self._log_batch_state(batch, "AFTER_UNION_GEN_OUTPUT", DEBUG_PATH)  # 新增
+                    
+                    
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
+                    #self._log_batch_state(batch, "AFTER_ADD_RESPONSE_MASK", DEBUG_PATH)  # 新增
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -954,6 +1347,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    #self._log_batch_state(batch, "FINAL_BATCH_STATE", DEBUG_PATH) 
 
                     with _timer("reward", timing_raw):
                         # compute reward model score
@@ -1057,10 +1451,78 @@ class RayPPOTrainer:
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer("testing", timing_raw):
+                            SCORE_LOG_PATH = self.config.data.score_log_path
+                            DEBUG_LOG_PATH = self.config.data.debug_log_path
+                            
+                            try:
+                                # 构造日志条目
+                                step_entry = { 
+                                    "validate_global_steps": self.global_steps
+                                    }
+
+                                # 写入JSON Lines文件（每行一个独立JSON对象）
+                                with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                                    json.dump(step_entry, f, ensure_ascii=False)
+                                    f.write("\n")  # 换行分隔不同条目
+                                print(f"[DEBUG LOG] 已记录step数据到 {SCORE_LOG_PATH}")
+                                with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                                    json.dump(step_entry, f, ensure_ascii=False)
+                                    f.write("\n")  # 换行分隔不同条目
+                                print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+                            except Exception as e:
+                                print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+
                             val_metrics: dict = self._validate()
+
+                            SCORE_LOG_PATH = self.config.data.score_log_path
+                            DEBUG_LOG_PATH = self.config.data.debug_log_path
+                            try:
+                                # 构造日志条目
+                                step_entry = { 
+                                    "test_global_steps": self.global_steps
+                                    }
+
+                                # 写入JSON Lines文件（每行一个独立JSON对象）
+                                with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                                    json.dump(step_entry, f, ensure_ascii=False)
+                                    f.write("\n")  # 换行分隔不同条目
+                                print(f"[DEBUG LOG] 已记录调试数据到 {SCORE_LOG_PATH}")
+                                with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                                    json.dump(step_entry, f, ensure_ascii=False)
+                                    f.write("\n")  # 换行分隔不同条目
+                                print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+                            except Exception as e:
+                                print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+                            test_metrics: dict = self._test()
+                            print(f"test_metrics={test_metrics}")
+                            
                             if is_last_step:
                                 last_val_metrics = val_metrics
+                                #这里加了一个最终的test集上的测试
+                                # SCORE_LOG_PATH = self.config.data.score_log_path
+                                # DEBUG_LOG_PATH = self.config.data.debug_log_path
+                                # try:
+                                #     # 构造日志条目
+                                #     step_entry = { 
+                                #         "test_global_steps": self.global_steps
+                                #         }
+
+                                #     # 写入JSON Lines文件（每行一个独立JSON对象）
+                                #     with open(SCORE_LOG_PATH, "a", encoding="utf-8") as f:
+                                #         json.dump(step_entry, f, ensure_ascii=False)
+                                #         f.write("\n")  # 换行分隔不同条目
+                                #     print(f"[DEBUG LOG] 已记录调试数据到 {SCORE_LOG_PATH}")
+                                #     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                                #         json.dump(step_entry, f, ensure_ascii=False)
+                                #         f.write("\n")  # 换行分隔不同条目
+                                #     print(f"[DEBUG LOG] 已记录step数据到 {DEBUG_LOG_PATH}")
+                                # except Exception as e:
+                                #     print(f"[DEBUG LOG ERROR] 日志记录失败: {str(e)}")
+                                # test_metrics: dict = self._test()
+                                # print(f"test_metrics={test_metrics}")
+                                
                         metrics.update(val_metrics)
+
 
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
@@ -1082,11 +1544,328 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                
+                progress_bar.update(1)
+                self.global_steps += 1
+
 
                 if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    print(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 
-                progress_bar.update(1)
-                self.global_steps += 1
+                
+
+    # def _save_data_proto_prompts(self, data_proto: DataProto, prefix: str = "prompt", save_dir: str = "prompt_validation", skip_special_tokens: bool = True) -> str:
+    #     tokenizer = self.tokenizer
+    #     # 确保保存目录存在
+    #     os.makedirs(save_dir, exist_ok=True)
+        
+    #     # 生成带时间戳的文件名
+    #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     file_path = os.path.join(save_dir, f"{prefix}_{timestamp}.txt")
+        
+    #     # 提取批次大小
+    #     batch_size = len(data_proto)
+        
+    #     # 初始化存储内容
+    #     save_content = [f"=== DataProto 验证 ===\n", 
+    #                 f"批次大小: {batch_size}\n\n"]
+        
+    #     # 提取full_prompts字段
+    #     full_prompts = []
+    #     if "full_prompts" in data_proto.non_tensor_batch:
+    #         # 处理np.ndarray类型
+    #         if isinstance(data_proto.non_tensor_batch["full_prompts"], np.ndarray):
+    #             full_prompts = data_proto.non_tensor_batch["full_prompts"].tolist()
+    #         # 处理其他类型（如list）
+    #         else:
+    #             full_prompts = list(data_proto.non_tensor_batch["full_prompts"])
+    #     else:
+    #         full_prompts = ["[无full_prompts字段]" for _ in range(batch_size)]
+        
+    #     # 提取input_ids张量并解码
+    #     input_ids_decoded = []
+    #     if data_proto.batch is not None and "input_ids" in data_proto.batch:
+    #         input_ids = data_proto.batch["input_ids"].cpu()
+    #         for ids in input_ids:
+    #             decoded = tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+    #             input_ids_decoded.append(decoded)
+    #     else:
+    #         input_ids_decoded = ["[无input_ids张量]" for _ in range(batch_size)]
+        
+    #     # 组装保存内容
+    #     for i in range(batch_size):
+    #         save_content.append(f"样本 {i}:\n")
+    #         save_content.append(f"  full_prompts: {full_prompts[i]}\n")
+    #         save_content.append(f"  input_ids解码: {input_ids_decoded[i]}\n")
+    #         save_content.append("-" * 80 + "\n")
+        
+    #     # 写入文件
+    #     with open(file_path, "w", encoding="utf-8") as f:
+    #         f.writelines(save_content)
+        
+    #     print(f"已保存至: {file_path}")
+    #     return file_path
+
+    def _re_tokenize_with_dynamic_prompts(self, batch: DataProto) -> DataProto:
+        """
+        动态生成Prompt并处理数据，确保输出的DataProto符合原始类约束（TensorDict类型、批量对齐）
+        """
+        # ------------------------ 配置与初始化 ------------------------
+        tokenizer = self.tokenizer
+        config = self.config.data
+        batch_size = len(batch)  
+
+        # ------------------------ 1. 动态生成Prompt ------------------------
+        dynamic_prompts = self._generate_dynamic_prompts(batch)  
+
+        # ------------------------ 2. 分词与后处理（保持为torch.Tensor） ------------------------
+        encoded = tokenizer(
+            dynamic_prompts,
+            max_length=config.max_prompt_length,
+            truncation="longest_first",
+            padding="max_length",
+            return_tensors="pt",  # 返回PyTorch张量
+            add_special_tokens=True
+        )
+
+        # 后处理（确保输出为torch.Tensor，不转numpy）
+        input_ids, attention_mask = verl_F.postprocess_data(
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            max_length=config.max_prompt_length,
+            pad_token_id=tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=config.truncation
+        )
+
+        # 生成position_ids（保持为torch.Tensor）
+        position_ids = compute_position_id_with_mask(attention_mask)
+        # if not isinstance(position_ids, torch.Tensor):
+        #     position_ids = torch.tensor(position_ids, dtype=torch.long)
+
+        # ------------------------ 3. 构造TensorDict作为新的batch ------------------------
+        # 直接使用torch.Tensor构造TensorDict（关键修复：batch必须是TensorDict类型）
+        tensors = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids
+        }
+        # 验证张量的批量大小（所有张量的dim0必须等于batch_size）
+        for key, tensor in tensors.items():
+            if tensor.shape[0] != batch_size:
+                raise ValueError(
+                    f"张量 {key} 的批量大小错误："
+                    f"预期 {batch_size}（原始批次大小），实际 {tensor.shape[0]}"
+                )
+
+        # 构造TensorDict，指定batch_size（元组格式，与原始DataProto兼容）
+        new_batch = TensorDict(
+            source=tensors,
+            batch_size=(batch_size,)  # 必须为元组（num_batch_dims=1）
+        )
+
+        # 遍历原始non_tensor_batch，逐个转换并检查批量大小
+        new_non_tensor_batch: Dict[str, np.ndarray] = {}
+        for key, value in batch.non_tensor_batch.items():
+            new_non_tensor_batch[key] = convert_to_ndarray(
+                data=value,
+                expected_batch_size=batch_size
+            )
+
+        dynamic_raw_prompt_ids = []
+        for prompt in dynamic_prompts:
+            # 不添加特殊token（与RLHFDataset的raw_prompt_ids生成逻辑一致）
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            original_length = len(prompt_ids)
+
+            # 截断逻辑（与RLHFDataset完全一致）
+            if original_length > config.max_prompt_length:
+                if config.truncation == "left":
+                    prompt_ids = prompt_ids[-config.max_prompt_length:]
+                elif config.truncation == "right":
+                    prompt_ids = prompt_ids[:config.max_prompt_length]
+                elif config.truncation == "middle":
+                    left_half = config.max_prompt_length // 2
+                    right_half = config.max_prompt_length - left_half
+                    prompt_ids = prompt_ids[:left_half] + prompt_ids[-right_half:]
+                elif config.truncation == "error":
+                    raise RuntimeError(
+                        f"动态提示长度{original_length}超过最大限制{config.max_prompt_length}（truncation=error）"
+                    )
+
+            dynamic_raw_prompt_ids.append(prompt_ids)
+
+        # 转换为np.ndarray(dtype=object)（与collate_fn处理raw_prompt_ids的格式一致）
+        new_non_tensor_batch["raw_prompt_ids"] = np.array(dynamic_raw_prompt_ids, dtype=object)
+        if new_non_tensor_batch["raw_prompt_ids"].shape[0] != batch_size:
+            raise ValueError(
+                f"raw_prompt_ids批量大小错误：预期{batch_size}，实际{new_non_tensor_batch['raw_prompt_ids'].shape[0]}"
+            )
+
+        # 动态生成的full_prompts必须为np.ndarray（dtype=object，shape[0]=batch_size）
+        new_non_tensor_batch["full_prompts"] = np.array(dynamic_prompts, dtype=object)
+        if new_non_tensor_batch["full_prompts"].shape[0] != batch_size:
+            raise ValueError(
+                f"full_prompts 批量大小错误："
+                f"预期 {batch_size}，实际 {new_non_tensor_batch['full_prompts'].shape[0]}"
+            )
+
+        # ------------------------ 5. 处理meta_info（直接继承原始值） ------------------------
+        new_meta_info = copy.deepcopy(batch.meta_info)  # 深拷贝避免修改原数据
+        
+        
+        return DataProto(
+            batch=new_batch,  # 核心修复：batch是TensorDict而非普通字典
+            non_tensor_batch=new_non_tensor_batch,
+            meta_info=new_meta_info
+        )
+
+    def _generate_dynamic_prompts(self, batch: DataProto) -> list[str]:
+        print("启动动态prompt生成，当前global_steps:", self.global_steps)
+    
+        TOOL_LOG_PATH = self.config.data.tool_log_path
+        
+       
+        original_prompts = batch.non_tensor_batch.get("full_prompts", [""] * len(batch))
+        
+        
+        dynamic_prompts = []
+        memory = ToolMemory()
+        fallback_count = 0
+        current_tool_descs_str = memory.get_all_tools()
+        #print(f"[TOOL_MEMORY_DEBUG] current_tool_descs_str内容:")
+        #print(current_tool_descs_str)
+        with open(TOOL_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[TOOL_MEMORY_DEBUG][Step {self.global_steps}] current_tool_descs_str内容:\n")
+            f.write(current_tool_descs_str + "\n" if current_tool_descs_str else "[空字符串]\n")
+        tokenizer = self.tokenizer
+
+        # 定义各模块标签（与原始Prompt结构顺序一致）
+        tool_info_tag = "# 工具信息\n"
+        car_info_tag = "\n\n# 进线车辆信息\n"
+        requirement_tag = "\n\n# 要求\n"
+        language_style_tag = "\n\n# 语言风格\n"
+        output_format_tag = "\n\n# 输出格式\n"
+        current_time_tag = "\n\n# 当前时间\n"
+
+        # 新增的要求说明（插入到"# 要求"末尾，"# 语言风格"前）
+        new_requirement = """
+    - 建议你基于 # 工具信息 中已有的工具（不可编造新工具），生成或修改其描述（如调整语言表述、补充细节、增加示例），以帮助你更高效地理解和使用工具，将会有助于你学习工具的使用。修改后的描述需与“# 工具信息”中的格式一致（如以“## 工具名”开头，包含“工具名称”“工具描述”“需要填入”“使用示例”等字段），关键信息点不可随意修改,包括## 后面的工具名字段，不可更改，最好只修改你在本次对话中使用到的工具描述。在工具描述部分要确保按照格式输出内容，不要加无关解释。
+        """.strip()
+
+        # 新增的输出格式示例（插入到"# 输出格式"末尾，"# 当前时间"前）
+        new_output_format = """
+    - 默认需要调用工具，先输出思考过程，再参考工具信息中的使用示例输出完整的工具调用信息，输出示例：
+    <thought>
+    思考内容
+    </thought>
+    <actions>
+    [search_used_cars({"query": "宝马三系"}), dcar_search({"query": "宝马三系和奔驰C级优势对比"})]
+    </actions>
+    <description>
+    ## 查询二手车库存\n工具名称：search_used_cars\n工具描述：可以通过查询内容和筛选条件对于库存内的车辆进行筛选，并展示数条搜索结果\n需要填入：\nquery (str)：查询的内容，可以类似“奔驰”，“增程式”这类\nfilters (dict)：筛选项，具体可选的筛选项为：\n    price_range (List[int])：价格区间（单位是万元），用[15, 21]表示需要筛选15万到21万的车辆\n    mileage (List[int])：里程区间（单位是万公里），用[1, 6]表示需要筛选1万公里到6万公里里程的车辆\n    car_age (List[int])：车龄（单位是年），用[2, 4]表示需要筛选车龄为两年以上四年以下的车辆\n    energy_type (str)：能源类型，必须是[\"新能源\", \"非新能源\"]之一，纯电/插混/增程均属于\"新能源\"\n    category (List[str])：车辆级别，必须是[\"轿车\", \"SUV\", \"MPV\", \"跑车\"]中的一个或多个\n    emission_standard (List[str])：排放标准，必须是[\"国四\", \"国五\", \"国六\", \"国六b\"]中的一个或多个\npage (int)：当前页码，默认值为1\npage_size (int)：每页检索条数，默认值为5，最大值为30\n使用示例：\n    search_used_cars({\"query\": \"mini\", \"filters\": {\"car_age\": [1, 4]}})\n    search_used_cars({\"query\": \"宝马三系\", \"page_size\": 20})\n    search_used_cars({\"filters\": {\"energy_type\": \"新能源\", \"category\": [\"轿车\", \"跑车\"]}, \"page_size\": 30})\n\n
+    </description>
+    
+        """.strip()
+
+        for prompt in original_prompts:
+            # 步骤1：替换工具信息段落（工具信息→进线车辆信息）
+            tool_start = prompt.find(tool_info_tag)
+            if tool_start != -1:
+                tool_end = prompt.find(car_info_tag, tool_start)
+                if tool_end == -1:
+                    # 工具信息无结束标签（边界情况）
+                    tool_section = f"{tool_info_tag}{current_tool_descs_str}"
+                    dynamic_prompt = prompt[:tool_start] + tool_section
+                else:
+                    # 正常替换工具信息段落
+                    tool_section = f"{tool_info_tag}{current_tool_descs_str}"
+                    dynamic_prompt = prompt[:tool_start] + tool_section + prompt[tool_end:]
+            else:
+                dynamic_prompt = prompt  # 无工具信息段落，保留原始内容
+
+            # 步骤2：在"# 要求"末尾插入新增要求（要求→语言风格）
+            req_start = dynamic_prompt.find(requirement_tag)
+            if req_start != -1:
+                # 定位"# 要求"的结束位置（即下一个模块"# 语言风格"的起始位置）
+                req_end = dynamic_prompt.find(language_style_tag, req_start)
+                if req_end == -1:
+                    # 无"# 语言风格"标签（边界情况），要求段落结束于Prompt末尾
+                    req_end = len(dynamic_prompt)
+                # 在"# 要求"现有内容后插入新要求（保持列表格式）
+                dynamic_prompt = (
+                    dynamic_prompt[:req_end] + 
+                    "\n- " + new_requirement.replace("\n", "\n- ") +  # 与原有要求列表格式一致
+                    dynamic_prompt[req_end:]
+                )
+
+            # 步骤3：在"# 输出格式"末尾插入新增示例（输出格式→当前时间）
+            fmt_start = dynamic_prompt.find(output_format_tag)
+            if fmt_start != -1:
+                # 定位"# 输出格式"的结束位置（即下一个模块"# 当前时间"的起始位置）
+                current_time_start = dynamic_prompt.find(current_time_tag)
+                # 用新内容替换原内容
+                dynamic_prompt = (
+                    dynamic_prompt[:fmt_start] +
+                    output_format_tag +
+                    new_output_format +
+                    dynamic_prompt[current_time_start:]
+                )
+
+
+
+            # 新增：动态Prompt长度检查与回退逻辑
+            # 计算动态Prompt的token长度
+            config = self.config.data
+            tokenized_length = len(tokenizer.tokenize(dynamic_prompt))
+            original_tokenized_length = len(tokenizer.tokenize(prompt))
+            max_prompt_length = config.max_prompt_length
+            if tokenized_length > max_prompt_length:
+                dynamic_prompt = prompt  # 回退到原始Prompt
+                fallback_count += 1
+                # with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                #     f.write(f"[FALLBACK][Step {self.global_steps}] 样本动态Prompt过长({tokenized_length}>{max_prompt_length})，回退原始Prompt\n")
+                #     f.write(f"  动态Prompt片段: {dynamic_prompt[:100]}...\n")
+                #     f.write(f"  原始Prompt片段: {prompt[:100]}...\n")
+                #     f.write(f"  动态token数: {tokenized_length}, 原始token数: {original_tokenized_length}\n")
+            
+            dynamic_prompts.append(dynamic_prompt)
+            
+        
+        # # 保存前检查动态prompts（保持原逻辑）
+        # valid_count = sum(1 for dp in dynamic_prompts if dp.strip())
+        # with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        #     f.write(f"[DEBUG][Step {self.global_steps}] 动态prompts生成完成，总数: {len(dynamic_prompts)}, 有效数: {valid_count}, 回退数: {fallback_count}\n")
+        #     f.write(f"[DEBUG] 有效dynamic_prompts示例（前1条）:\n")
+        #     for i, dp in enumerate(dynamic_prompts[:1]):
+        #         f.write(f"--- 有效dynamic_prompt {i+1} (长度: {len(dp)}) ---\n")
+        #         f.write(dp + "\n" if dp else "(空prompt)\n")
+        
+        
+        # try:
+        #     with open(SAVE_PATH, "a", encoding="utf-8") as f:
+        #         f.write(f"===== Step {self.global_steps} ==== (总数: {len(dynamic_prompts)}, 有效数: {valid_count}, 回退数: {fallback_count})\n")
+        #         for i, dp in enumerate(dynamic_prompts):
+        #             f.write(f"--- Prompt {i+1} ---\n")
+        #             f.write(dp + "\n" if dp else "(空prompt)\n")
+        #             f.write("="*50 + "\n")
+        #     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        #         f.write(f"[DEBUG] 动态prompts已保存至 {SAVE_PATH}\n")
+        # except Exception as e:
+        #     with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        #         f.write(f"[ERROR] 保存动态prompts失败: {str(e)}\n")
+        #     print(f"[ERROR] 保存动态prompts失败: {str(e)}")
+        
+        # with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        #     f.write(f"[END] 动态prompt生成 - Step {self.global_steps}\n{'='*80}\n")
+        
+        return dynamic_prompts
+
+
+        
+
+
+    
+   

@@ -276,7 +276,7 @@ def postprocess_data(
     Returns:
         (input_ids, attention_mask) padded/truncated to max_length
     """
-    assert truncation in ["left", "right", "middle", "error"]
+    assert truncation in ["left", "right", "middle", "error", "longest_first"]
     assert input_ids.ndim == 2
 
     sequence_length = input_ids.shape[-1]

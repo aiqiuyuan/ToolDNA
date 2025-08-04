@@ -27,36 +27,23 @@ from verl.trainer.ppo.reward import load_reward_manager
 def get_custom_reward_fn(config):
     import importlib.util
     import sys
-
+    
     reward_fn_config = config.get("custom_reward_function") or {}
     file_path = reward_fn_config.get("path")
     if not file_path:
         return None
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
-
-    spec = importlib.util.spec_from_file_location("custom_module", file_path)
+    # 加载模块（确保compute_score在模块顶层）
+    spec = importlib.util.spec_from_file_location("aisale_reward_module", file_path)
     module = importlib.util.module_from_spec(spec)
-    try:
-        sys.modules["custom_module"] = module
-        spec.loader.exec_module(module)
-    except Exception as e:
-        raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
-
-    function_name = reward_fn_config.get("name")
-    if not hasattr(module, function_name):
-        raise AttributeError(f"Reward function '{function_name}' not found in '{file_path}'.")
-
-    print(f"using customized reward function '{function_name}' from '{file_path}'")
+    sys.modules["aisale_reward_module"] = module
+    spec.loader.exec_module(module)
+    
+    function_name = reward_fn_config.get("name", "compute_score")
     raw_fn = getattr(module, function_name)
-
-    reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
-
-    def wrapped_fn(*args, **kwargs):
-        return raw_fn(*args, **kwargs, **reward_kwargs)
-
-    return wrapped_fn
+    
+    # 直接返回模块顶层函数（无闭包）
+    return raw_fn
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -68,7 +55,7 @@ def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}},
+            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN",  "VLLM_LOGGING_LEVEL": "WARN"}},
             num_cpus=config.ray_init.num_cpus,
         )
 
@@ -164,6 +151,8 @@ class TaskRunner:
 
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+        test_dataset = create_rl_dataset(config.data.test_files, config.data, tokenizer, processor)
+
         train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = RayPPOTrainer(
             config=config,
@@ -176,6 +165,7 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            test_dataset=test_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
             device_name=config.trainer.device,
