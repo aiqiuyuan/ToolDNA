@@ -242,7 +242,7 @@ def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_
     # 获取单例memory
     memory = ToolMemory()  # 自动获取全局唯一实例
 
-    DEBUG_LOG_PATH = "/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/debug_records_0622.jsonl"
+    DEBUG_LOG_PATH = ""
     
     """
     综合评分：
