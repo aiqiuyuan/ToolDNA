@@ -8,9 +8,11 @@ export HYDRA_FULL_ERROR=1
 export WANDB_BASE_URL=https://api.bandw.top
 wandb login edfcef4f9801daf389c28a3b7bc6b75073fdccfb
 
-train_files="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/data/0515/data_human_baseline/train_sft.parquet"
-val_files="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/data/0515/data_human_baseline/val_sft.parquet"
-test_files="/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/data/0515/data_human_baseline/test_sft.parquet"
+train_files=""
+val_files=""
+test_files=""
+model_path=""
+local_dir=""
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: run_qwen_05_sp2.sh <nproc_per_node> <save_path> [other_configs...]"
@@ -25,7 +27,7 @@ shift 2
 
 torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
      -m verl.trainer.fsdp_sft_trainer \
-    data.train_files="$train_files" \
+    data.train_files="$model_path" \
     data.val_files="$test_files" \
     data.prompt_key=extra_info \
     data.response_key=extra_info \
@@ -36,8 +38,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     +trainer.precision=bf16 \
     +trainer.gradient_accumulation_steps=4 \
     +model.gradient_checkpointing=true \
-    model.partial_pretrain=/mnt/bn/motor-nlp-team/models/LLM/base_models/Qwen2.5-7B-Instruct \
-    trainer.default_local_dir=/mnt/bn/motor-nlp-team/users/aiqiuyuan/verl_debug/sft \
+    model.partial_pretrain="$model_path" \
+    trainer.default_local_dir="$local_dir" \
     trainer.project_name=gsm8k-sft \
     trainer.experiment_name=ai_sale_sft \
     trainer.logger=['console'] \
