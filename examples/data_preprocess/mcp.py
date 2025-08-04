@@ -12,55 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the MATH-lighteval dataset to parquet format
+Preprocess the aisale dataset to parquet format
 """
 
 import argparse
 import os
+import re
 
 import datasets
 
 from verl.utils.hdfs_io import copy, makedirs
-from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
-
-
-def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/math")
+    parser.add_argument("--local_dir", default="/mnt/bn/motor-nlp-team/users/aiqiuyuan/demo_mcp_llm")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
-    # 'lighteval/MATH' is no longer available on huggingface.
-    # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
-    data_source = "DigitalLearningGmbH/MATH-lighteval"
-    print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    dataset = datasets.load_dataset(data_source, trust_remote_code=True)
+    data_source = "/mnt/bn/motor-nlp-team/users/aiqiuyuan/demo_mcp_llm"
 
-    train_dataset = dataset["train"]
-    test_dataset = dataset["test"]
 
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    ds = datasets.load_dataset("json", data_files={
+        "train":os.path.join(data_source, "train_processed_mcp.json"),
+        "validation": os.path.join(data_source, "test_processed_mcp.json")
+        })
+    train_dataset = ds["train"]
+    test_dataset = ds["validation"]
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question = example.pop("problem")
+            question_raw = example.pop("question")
+            answer_raw = example.pop("mcp_call")
 
-            question = question + " " + instruction_following
-
-            answer = example.pop("solution")
-            solution = extract_solution(answer)
             data = {
                 "data_source": data_source,
-                "prompt": [{"role": "user", "content": question}],
+                "prompt": [
+                    {"role": "system", "content": ""},
+                    {"role": "user", "content": question_raw}
+                ],
                 "ability": "math",
-                "reward_model": {"style": "rule", "ground_truth": solution},
-                "extra_info": {"split": split, "index": idx},
+                "reward_model": {"style": "rule", "ground_truth": answer_raw},
+                "extra_info": {
+                    "split": split,
+                    "index": idx,
+                },
             }
             return data
 
@@ -72,8 +70,8 @@ if __name__ == "__main__":
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
-    test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
+    train_dataset.to_parquet(os.path.join(local_dir, "train_mcp2.parquet"))
+    test_dataset.to_parquet(os.path.join(local_dir, "test_mcp2.parquet"))
 
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
